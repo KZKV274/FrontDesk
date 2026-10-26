@@ -1,6 +1,6 @@
 /* FrontDesk: local-first helper for a hotel receptionist */
 "use strict";
-const APP_VERSION = "1.3";
+const APP_VERSION = "1.4";
 const STORAGE_KEY = "frontdesk_data", IDB_NAME = "FrontDeskDB";
 const BACKUP_REMIND_DAYS = 7, ARCHIVE_LIMIT = 90;
 
@@ -168,6 +168,7 @@ function renderRooms() {
       <div class="s-dirty"><span>Грязных</span><b>${c.dirty}</b></div>
       <div class="s-repair"><span>Ремонт</span><b>${c.repair}</b></div>
     </div>
+    <button class="btn secondary hk-btn" data-action="housekeeping">🧹 Список для горничных</button>
     ${c.overdue ? `<button class="alert" data-filter="checkout">⚠ Просрочен выезд: ${ROOMS.filter(r => roomFlag(roomData(r.num)) === "overdue").map(r => r.num).join(", ")}</button>` : ""}
     ${prepList().length ? `<button class="alert prep" data-filter="arrival">🧹 Подготовить к заезду: ${prepList().map(r => `${r.num} (${roomData(r.num).status === "occupied" ? "ещё занят" : "грязный"})`).join(", ")}</button>` : ""}
     <div class="chip-row">${chips.map(([id, l, n]) => `<button class="chip ${state.roomFilter === id ? "active" : ""}" data-filter="${id}">${l} <small>${n}</small></button>`).join("")}</div>
@@ -265,6 +266,7 @@ function renderShift() {
     </div>
     <div class="btn-col">
       <button class="btn" data-action="report">📋 Посмотреть отчёт</button>
+      <button class="btn secondary" data-action="housekeeping">🧹 Список для горничных</button>
       <button class="btn secondary" data-action="close-shift">Закрыть смену</button>
     </div>` : ""}
 
@@ -357,8 +359,43 @@ function netChanges(log) {
   });
   return [...by.values()].filter(l => l.path.length > 3 || l.path[0] !== l.path[l.path.length - 1]).sort((a, b) => a.t - b.t);
 }
-function showReport(text, title = "Отчёт за смену") {
-  const box = openModal(`<h3>${title}</h3><p class="muted small">Можно переписать в журнал, скопировать или отправить.</p><pre class="report">${esc(text)}</pre>
+// Morning list for housekeeping: who checks out today, which rooms get arrivals, who stays and until when
+function housekeepingText() {
+  const now = new Date(), rd = n => roomData(n), d = iso => ddmm(parseDate(iso)), L = [];
+  const outs = ROOMS.filter(r => roomFlag(rd(r.num)));
+  const arr = ROOMS.filter(r => arrivalFlag(rd(r.num)));
+  const arrSet = new Set(arr.map(r => r.num));
+  outs.sort((a, b) => arrSet.has(b.num) - arrSet.has(a.num));
+  const ready = x => (x.status === "free" ? 2 : x.status === "dirty" ? 1 : 0);
+  arr.sort((a, b) => ready(rd(a.num)) - ready(rd(b.num)) || (rd(a.num).arrivalTime || "99").localeCompare(rd(b.num).arrivalTime || "99"));
+  const staying = ROOMS.filter(r => rd(r.num).status === "occupied" && !roomFlag(rd(r.num)));
+  const dirty = ROOMS.filter(r => rd(r.num).status === "dirty" && !arrSet.has(r.num));
+  const rep = ROOMS.filter(r => ["repair", "block"].includes(rd(r.num).status));
+  L.push(`ГОРНИЧНЫМ · ${ddmm(now)}, ${fmt({ weekday: "long" }, now)}`);
+  L.push(`Выезд ${outs.length} · заезд ${arr.length} · проживают ${staying.length}`, "");
+  if (outs.length) {
+    L.push(`ВЫЕЗД СЕГОДНЯ (${outs.length}):`);
+    outs.forEach(r => { const x = rd(r.num); L.push(`• ${r.num} ${ROOM_TYPES[r.type]}${roomFlag(x) === "overdue" ? " — выезд был " + d(x.checkout) + "!" : ""}${arrSet.has(r.num) ? ` → сегодня заезд${x.arrivalTime ? " в " + x.arrivalTime : ""}, убрать в первую очередь` : ""}`); });
+    L.push("");
+  }
+  if (arr.length) {
+    L.push(`ЗАЕЗД СЕГОДНЯ (${arr.length}):`);
+    arr.forEach(r => { const x = rd(r.num); L.push(`• ${r.num} ${ROOM_TYPES[r.type]}${x.arrivalTime ? " в " + x.arrivalTime : ""} — ${x.status === "occupied" ? "после выезда гостя" : x.status === "dirty" ? "не убран" : x.status === "free" ? "готов" : STATUS[x.status].label.toLowerCase()}`); });
+    L.push("");
+  }
+  if (dirty.length) L.push(`ГРЯЗНЫЕ (${dirty.length}): ${dirty.map(r => r.num).join(", ")}`, "");
+  if (staying.length) {
+    L.push(`ПРОЖИВАЮТ (${staying.length}):`);
+    FLOORS.forEach(f => { const xs = staying.filter(r => r.floor === f); if (xs.length) L.push(`${f} эт: ${xs.map(r => r.num + (rd(r.num).checkout ? " до " + d(rd(r.num).checkout) : "")).join(", ")}`); });
+    L.push("");
+  }
+  if (rep.length) L.push(`РЕМОНТ / БЛОК: ${rep.map(r => r.num).join(", ")}`);
+  const noDate = staying.filter(r => !rd(r.num).checkout).map(r => r.num);
+  const note = noDate.length ? `<div class="warn small">Не указана дата выезда: ${noDate.join(", ")}. Открой номер и поставь дату — тогда в списке будет «до …».</div>` : "";
+  return { text: L.join("\n").trim(), note };
+}
+function showReport(text, title = "Отчёт за смену", note = "") {
+  const box = openModal(`<h3>${title}</h3><p class="muted small">${note ? "Скопируй или отправь в чат горничных." : "Можно переписать в журнал, скопировать или отправить."}</p>${note}<pre class="report">${esc(text)}</pre>
     <div class="modal-actions"><button class="btn secondary" data-copy>Копировать</button>${navigator.share ? `<button class="btn secondary" data-share>Отправить</button>` : ""}<button class="btn" data-close>Закрыть</button></div>`);
   box.querySelector("[data-copy]").onclick = () => copy(text);
   const sh = box.querySelector("[data-share]");
@@ -633,6 +670,7 @@ document.addEventListener("click", e => {
   if ((el = q("[data-action]"))) {
     const a = el.dataset.action;
     if (a === "report") return showReport(reportText());
+    if (a === "housekeeping") { const hk = housekeepingText(); return showReport(hk.text, "Для горничных", hk.note); }
     if (a === "close-shift") return confirmModal("Закрыть смену?", "Отчёт сохранится в «Прошлые смены», невыполненное перейдёт в следующую смену. Статусы номеров не меняются.", "Закрыть смену", closeShift);
     if (a === "edit-shift") return editShiftDialog();
     if (a === "add-contact") return editContact(null);

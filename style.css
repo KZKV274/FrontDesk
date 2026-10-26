@@ -204,3 +204,7 @@ textarea{resize:vertical}
 .hb i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),#63A4FF);border-radius:inherit}
 .hb b{text-align:right}
 .item > .room-tag{flex:none;margin-top:3px}
+
+/* v1.4: housekeeping list */
+.hk-btn{width:100%;margin-bottom:12px}
+.modal .warn.small{font-size:12px;font-weight:600;margin:8px 0 0}
