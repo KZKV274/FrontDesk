@@ -1,6 +1,6 @@
 /* FrontDesk: local-first helper for a hotel receptionist */
 "use strict";
-const APP_VERSION = "1.1";
+const APP_VERSION = "1.2";
 const STORAGE_KEY = "frontdesk_data", IDB_NAME = "FrontDeskDB";
 const BACKUP_REMIND_DAYS = 7, ARCHIVE_LIMIT = 90;
 
@@ -27,14 +27,16 @@ const state = { view: "rooms", roomFilter: "all", data: null };
 const emptyData = () => ({
   version: 1, savedAt: 0,
   rooms: {}, // num -> {status, note, checkout, since, updatedAt}
-  shift: newShift([]),
+  shift: null, // {id, startedAt, kind: "day" | "night", items, log} while a shift is running
+  pending: [], // notes left for the next shift (unfinished items, or written while no shift is running)
+  pendingLog: [], // room status changes made while no shift is running
   archive: [],
-  reminders: [],
   contacts: [],
   tips: [],
   settings: { lastBackupAt: 0 },
 });
-function newShift(carried) { return { id: uid(), startedAt: Date.now(), items: carried, log: [] }; }
+const KIND = { day: "Дневная", night: "Ночная" };
+const guessKind = d => (d.getHours() >= 6 && d.getHours() < 17 ? "day" : "night");
 
 /* ---------- helpers ---------- */
 const $ = s => document.querySelector(s);
@@ -95,9 +97,12 @@ function normalize(d) {
   const base = emptyData();
   if (!d || typeof d !== "object") return base;
   const out = { ...base, ...d, settings: { ...base.settings, ...(d.settings || {}) } };
-  ["archive", "reminders", "contacts", "tips"].forEach(k => { if (!Array.isArray(out[k])) out[k] = []; });
-  if (!out.shift || !Array.isArray(out.shift.items)) out.shift = newShift([]);
-  if (!Array.isArray(out.shift.log)) out.shift.log = [];
+  ["archive", "contacts", "tips", "pending", "pendingLog"].forEach(k => { if (!Array.isArray(out[k])) out[k] = []; });
+  delete out.reminders;
+  if (out.shift && Array.isArray(out.shift.items)) {
+    if (!Array.isArray(out.shift.log)) out.shift.log = [];
+    if (!KIND[out.shift.kind]) out.shift.kind = guessKind(new Date(out.shift.startedAt));
+  } else out.shift = null;
   if (!out.rooms || typeof out.rooms !== "object") out.rooms = {};
   // v1.0 had "booked" as a status; it is now an arrival mark on a free room
   Object.values(out.rooms).forEach(rd => { if (rd.status === "booked") { rd.status = "free"; rd.arrival = rd.arrival || today(); } if (!STATUS[rd.status]) rd.status = "free"; });
@@ -108,8 +113,8 @@ async function requestPersist() {
 }
 
 /* ---------- navigation ---------- */
-const navItems = [["rooms", "▦", "Номера"], ["shift", "✎", "Смена"], ["reminders", "⏰", "Напоминания"], ["more", "☰", "Ещё"]];
-const titles = { rooms: "Номера", shift: "Передача смены", reminders: "Напоминания", more: "Ещё" };
+const navItems = [["rooms", "▦", "Номера"], ["shift", "✎", "Смена"], ["more", "☰", "Ещё"]];
+const titles = { rooms: "Номера", shift: "Смена", more: "Ещё" };
 function go(view) {
   if (view !== state.view) history.pushState({ view }, "");
   state.view = view;
@@ -120,9 +125,9 @@ window.addEventListener("popstate", e => { closeModal(); state.view = (e.state &
 
 function render() {
   document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + state.view));
-  const due = dueReminders().length;
-  $("#bottomNav").innerHTML = navItems.map(([id, icon, label]) => `<button class="nav-item ${state.view === id ? "active" : ""}" data-nav="${id}"><span class="nav-icon">${icon}${id === "reminders" && due ? `<i class="badge">${due}</i>` : ""}</span><span>${label}</span></button>`).join("");
-  ({ rooms: renderRooms, shift: renderShift, reminders: renderReminders, more: renderMore })[state.view]();
+  if (!titles[state.view]) state.view = "rooms";
+  $("#bottomNav").innerHTML = navItems.map(([id, icon, label]) => `<button class="nav-item ${state.view === id ? "active" : ""}" data-nav="${id}"><span class="nav-icon">${icon}${id === "shift" && !state.data.shift ? `<i class="badge">!</i>` : ""}</span><span>${label}</span></button>`).join("");
+  ({ rooms: renderRooms, shift: renderShift, more: renderMore })[state.view]();
   $("#pageTitle").textContent = titles[state.view];
   $("#todayLabel").textContent = fmt({ weekday: "long", day: "numeric", month: "long" }, new Date());
 }
@@ -181,7 +186,7 @@ function setRoomStatus(num, status) {
   if (status === "occupied" && arrivalFlag(rd)) { rd.arrival = ""; rd.arrivalTime = ""; }
   rd.updatedAt = Date.now();
   state.data.rooms[num] = rd;
-  state.data.shift.log.push({ t: Date.now(), room: num, from, to: status });
+  (state.data.shift ? state.data.shift.log : state.data.pendingLog).push({ t: Date.now(), room: num, from, to: status });
   save();
   vibrate(15);
 }
@@ -217,41 +222,49 @@ function closeRoomSheet() { closeModal(); render(); }
 
 /* ---------- shift handover ---------- */
 function renderShift() {
-  const sh = state.data.shift, items = sh.items, open = items.filter(i => !i.done).length;
-  const c = roomCounts(), started = new Date(sh.startedAt);
+  const sh = state.data.shift, items = sh ? sh.items : state.data.pending, open = items.filter(i => !i.done).length;
+  const c = roomCounts();
   const repair = ROOMS.filter(r => ["repair", "block"].includes(roomData(r.num).status));
   const checkouts = ROOMS.filter(r => roomFlag(roomData(r.num)));
-  const remToday = state.data.reminders.filter(x => !x.done && x.date <= dateISO(addDays(new Date(), 1))).sort(byWhen);
+  const head = sh ? `
+    <div class="card shift-card live">
+      <div class="row"><div><span class="pill">● ${KIND[sh.kind]} смена</span><b class="big">с ${hmOf(new Date(sh.startedAt))}</b><span class="muted small">${fmt({ weekday: "short", day: "numeric", month: "long" }, new Date(sh.startedAt))} · идёт ${duration(Date.now() - sh.startedAt)}</span></div>
+      <div class="right"><span class="muted small">Записей</span><b class="big">${items.length - open}/${items.length}</b><span class="muted small">выполнено</span></div></div>
+      <button class="link edit-start" data-action="edit-shift">Изменить время / тип смены</button>
+    </div>` : `
+    <div class="card shift-card idle">
+      <span class="muted small">Смена не начата</span>
+      <b class="big">Начать смену</b>
+      ${state.data.archive[0] ? `<span class="muted small">Прошлая закрыта ${fmt({ day: "numeric", month: "short" }, new Date(state.data.archive[0].closedAt))} в ${hmOf(new Date(state.data.archive[0].closedAt))}</span>` : ""}
+      <div class="kind-row">${Object.entries(KIND).map(([k, l]) => `<button class="btn ${k === guessKind(new Date()) ? "" : "secondary"}" data-start="${k}">${k === "day" ? "☀" : "☾"} ${l}</button>`).join("")}</div>
+      <span class="muted small">Время начала — сейчас, ${hmOf(new Date())}. Его можно поправить после старта.</span>
+    </div>`;
   $("#view-shift").innerHTML = `
-    <div class="card shift-card">
-      <div class="row"><div><span class="muted small">Смена началась</span><b class="big">${hmOf(started)}</b><span class="muted small">${fmt({ weekday: "short", day: "numeric", month: "long" }, started)}</span></div>
-      <div class="right"><span class="muted small">Задач</span><b class="big">${items.length - open}/${items.length}</b><span class="muted small">выполнено</span></div></div>
-    </div>
+    ${head}
+    <div class="section-head"><h3>${sh ? "Передать сменщику" : "Для следующей смены"}</h3><span>${items.length || ""}</span></div>
     <form class="add-row" id="itemForm" autocomplete="off">
       <input name="room" list="roomList" inputmode="numeric" placeholder="№" maxlength="4" class="room-input">
-      <input name="text" placeholder="Что передать сменщику…" maxlength="300" required>
+      <input name="text" placeholder="${sh ? "Что передать сменщику…" : "Заметка на следующую смену…"}" maxlength="300" required>
       <button class="btn add-btn" aria-label="Добавить">＋</button>
     </form>
     <datalist id="roomList">${ROOMS.map(r => `<option value="${r.num}">`).join("")}</datalist>
-    <div class="list">${items.length ? items.map(itemRow).join("") : `<div class="empty">Записей пока нет. Добавляй сюда всё, что нужно передать: поздние выезды, просьбы гостей, проблемы, оплаты.</div>`}</div>
+    <div class="list">${items.length ? items.map(itemRow).join("") : `<div class="empty">${sh ? "Записей пока нет. Добавляй сюда всё, что нужно передать: поздние выезды, просьбы гостей, проблемы, оплаты." : "Невыполненное с прошлой смены и заметки, записанные сейчас, появятся в новой смене."}</div>`}</div>
 
-    <div class="section-head"><h3>Автоматически в отчёт</h3></div>
+    ${sh ? `<div class="section-head"><h3>Автоматически в отчёт</h3></div>
     <div class="card info">
       <div><span>Занято / свободно / грязных</span><b>${c.occupied} / ${c.free} / ${c.dirty}</b></div>
       <div><span>Выезды сегодня</span><b>${checkouts.length ? checkouts.map(r => r.num + (roomFlag(roomData(r.num)) === "overdue" ? "⚠" : "")).join(", ") : "—"}</b></div>
       <div><span>Заезды сегодня</span><b>${ROOMS.filter(r => arrivalFlag(roomData(r.num))).map(r => r.num + (prepList().includes(r) ? "🧹" : "")).join(", ") || "—"}</b></div>
       <div><span>Ремонт / блок</span><b>${repair.length ? repair.map(r => r.num).join(", ") : "—"}</b></div>
-      <div><span>Напоминания на сегодня-завтра</span><b>${remToday.length || "—"}</b></div>
       <div><span>Изменений статусов за смену</span><b>${netChanges(sh.log).length || "—"}</b></div>
     </div>
-
     <div class="btn-col">
       <button class="btn" data-action="report">📋 Посмотреть отчёт</button>
-      <button class="btn secondary" data-action="close-shift">Закрыть смену и начать новую</button>
-    </div>
+      <button class="btn secondary" data-action="close-shift">Закрыть смену</button>
+    </div>` : ""}
 
     ${state.data.archive.length ? `<div class="section-head"><h3>Прошлые смены</h3><span>${state.data.archive.length}</span></div>
-    <div class="list">${state.data.archive.slice(0, 30).map(a => `<button class="arch-row" data-archive="${a.id}"><b>${fmt({ day: "numeric", month: "short" }, new Date(a.startedAt))} ${hmOf(new Date(a.startedAt))} – ${hmOf(new Date(a.closedAt))}</b><span>${a.items.length} ${plural(a.items.length, "запись", "записи", "записей")}</span></button>`).join("")}</div>` : ""}`;
+    <div class="list">${state.data.archive.slice(0, 30).map(a => `<button class="arch-row" data-archive="${a.id}"><b>${a.kind ? (a.kind === "day" ? "☀ " : "☾ ") : ""}${fmt({ day: "numeric", month: "short" }, new Date(a.startedAt))} ${hmOf(new Date(a.startedAt))} – ${hmOf(new Date(a.closedAt))}</b><span>${a.items.length} ${plural(a.items.length, "запись", "записи", "записей")}</span></button>`).join("")}</div>` : ""}`;
   $("#itemForm").addEventListener("submit", e => {
     e.preventDefault();
     const f = e.currentTarget, text = f.elements.text.value.trim(), room = f.elements.room.value.trim();
@@ -262,9 +275,39 @@ function renderShift() {
     setTimeout(() => $("#itemForm [name=text]")?.focus(), 50);
   });
 }
+const duration = ms => { const m = Math.max(0, Math.floor(ms / 60000)); return m >= 60 ? `${Math.floor(m / 60)} ч ${m % 60} мин` : `${m} мин`; };
 function addShiftItem(text, room) {
-  state.data.shift.items.push({ id: uid(), text, room: room || "", done: false, createdAt: Date.now() });
+  (state.data.shift ? state.data.shift.items : state.data.pending).push({ id: uid(), text, room: room || "", done: false, createdAt: Date.now() });
   save();
+}
+function shiftItems() { return state.data.shift ? state.data.shift.items : state.data.pending; }
+function startShift(kind) {
+  state.data.shift = { id: uid(), startedAt: Date.now(), kind, items: state.data.pending, log: state.data.pendingLog };
+  state.data.pending = []; state.data.pendingLog = [];
+  save(); vibrate(20); render();
+  toast(`${KIND[kind]} смена началась в ${hmOf(new Date())}`);
+}
+function editShiftDialog() {
+  const sh = state.data.shift, d = new Date(sh.startedAt);
+  const box = openModal(`<h3>Смена</h3><p class="muted">Если начал работу раньше, чем нажал «Начать смену».</p>
+    <form class="form" id="shiftEdit">
+      <div class="kind-row">${Object.entries(KIND).map(([k, l]) => `<label class="radio"><input type="radio" name="kind" value="${k}" ${sh.kind === k ? "checked" : ""}><span>${k === "day" ? "☀" : "☾"} ${l}</span></label>`).join("")}</div>
+      <div class="date-row two"><input type="date" name="date" value="${dateISO(d)}" required><input type="time" name="time" value="${hmOf(d)}" required></div>
+      <div class="modal-actions"><button type="button" class="btn danger" data-cancel-shift>Отменить смену</button><button class="btn">Сохранить</button></div>
+    </form>`);
+  box.querySelector("#shiftEdit").onsubmit = e => {
+    e.preventDefault();
+    const el = e.currentTarget.elements, t = parseDate(el.date.value), [h, m] = el.time.value.split(":").map(Number);
+    t.setHours(h, m, 0, 0);
+    if (t > new Date()) return toast("Начало не может быть в будущем");
+    Object.assign(sh, { startedAt: t.getTime(), kind: el.kind.value });
+    save(); closeModal(); render(); toast("Сохранено");
+  };
+  box.querySelector("[data-cancel-shift]").onclick = () => confirmModal("Отменить смену?", "Смена не попадёт в архив. Записи и изменения номеров перейдут в следующую смену.", "Отменить смену", () => {
+    state.data.pending = [...sh.items, ...state.data.pending];
+    state.data.pendingLog = [...sh.log, ...state.data.pendingLog];
+    state.data.shift = null; save(); render(); toast("Смена отменена");
+  });
 }
 function itemRow(i) {
   return `<div class="item ${i.done ? "done" : ""}">
@@ -274,7 +317,7 @@ function itemRow(i) {
 }
 function reportText(sh = state.data.shift, closedAt = Date.now()) {
   const s = new Date(sh.startedAt), e = new Date(closedAt), L = [];
-  L.push(`ПЕРЕДАЧА СМЕНЫ`, `${ddmm(s)} ${hmOf(s)} – ${ddmm(e)} ${hmOf(e)}`, "");
+  L.push(`ПЕРЕДАЧА СМЕНЫ${sh.kind ? " · " + KIND[sh.kind].toLowerCase() : ""}`, `${ddmm(s)} ${hmOf(s)} – ${ddmm(e)} ${hmOf(e)}`, "");
   const open = sh.items.filter(i => !i.done), done = sh.items.filter(i => i.done);
   const line = (i, mark) => `${mark} ${i.room ? i.room + " — " : ""}${i.text}`;
   if (open.length) { L.push("НЕ ВЫПОЛНЕНО / ПЕРЕДАЮ:"); open.forEach(i => L.push(line(i, "▢"))); L.push(""); }
@@ -291,8 +334,6 @@ function reportText(sh = state.data.shift, closedAt = Date.now()) {
   if (repair.length) { L.push("Ремонт / блок:"); repair.forEach(x => L.push("• " + x)); }
   const notes = ROOMS.filter(r => roomData(r.num).note && !["repair", "block"].includes(roomData(r.num).status));
   if (notes.length) { L.push("", "ЗАМЕТКИ ПО НОМЕРАМ:"); notes.forEach(r => L.push(`• ${r.num} — ${roomData(r.num).note}`)); }
-  const rem = state.data.reminders.filter(x => !x.done && x.date <= dateISO(addDays(e, 1))).sort(byWhen);
-  if (rem.length) { L.push("", "НАПОМИНАНИЯ:"); rem.forEach(x => L.push(`• ${x.date === dateISO(e) ? "" : ddmm(parseDate(x.date)) + " "}${x.time} ${x.room ? x.room + " — " : ""}${x.text}`)); }
   const changes = netChanges(sh.log);
   if (changes.length) { L.push("", "ИЗМЕНЕНИЯ ЗА СМЕНУ:"); changes.forEach(l => L.push(`${hmOf(new Date(l.t))} ${l.room}: ${l.path.map(statusLabel).join(" → ")}`)); }
   return L.join("\n").trim();
@@ -319,76 +360,16 @@ function showReport(text, title = "Отчёт за смену") {
 function closeShift() {
   const sh = state.data.shift, closedAt = Date.now();
   const text = reportText(sh, closedAt);
-  state.data.archive.unshift({ id: sh.id, startedAt: sh.startedAt, closedAt, items: sh.items, log: sh.log, text });
+  state.data.archive.unshift({ id: sh.id, startedAt: sh.startedAt, closedAt, kind: sh.kind, items: sh.items, log: sh.log, text });
   state.data.archive = state.data.archive.slice(0, ARCHIVE_LIMIT);
   const carried = sh.items.filter(i => !i.done).map(i => ({ ...i, carried: true }));
-  state.data.shift = newShift(carried);
+  state.data.pending = [...carried, ...state.data.pending];
+  state.data.shift = null;
   save();
   render();
   showReport(text, "Смена закрыта");
-  toast(carried.length ? `Новая смена. Перенесено задач: ${carried.length}` : "Новая смена начата");
+  toast(carried.length ? `Смена закрыта. В следующую смену перейдёт: ${carried.length}` : "Смена закрыта");
 }
-
-/* ---------- reminders ---------- */
-const byWhen = (a, b) => (a.date + a.time).localeCompare(b.date + b.time);
-const remDate = x => { const d = parseDate(x.date); const [h, m] = x.time.split(":").map(Number); d.setHours(h, m, 0, 0); return d; };
-const dueReminders = () => state.data ? state.data.reminders.filter(x => !x.done && remDate(x) <= new Date()) : [];
-function renderReminders() {
-  const xs = state.data.reminders.slice().sort(byWhen), now = new Date(), t = today(), tm = dateISO(addDays(now, 1));
-  const active = xs.filter(x => !x.done), done = xs.filter(x => x.done).slice(-15).reverse();
-  const groups = [["Просрочено", active.filter(x => remDate(x) <= now)], ["Сегодня", active.filter(x => x.date === t && remDate(x) > now)], ["Завтра", active.filter(x => x.date === tm)], ["Позже", active.filter(x => x.date > tm)]];
-  $("#view-reminders").innerHTML = `
-    <form class="card rem-form" id="remForm" autocomplete="off">
-      <div class="chip-row">${["Будильник", "Такси", "Трансфер", "Поздний выезд", "Звонок"].map(k => `<button type="button" class="chip" data-rem-kind="${k}">${k}</button>`).join("")}</div>
-      <input name="text" placeholder="Например: разбудить, такси в аэропорт" maxlength="200" required>
-      <div class="rem-grid">
-        <input name="room" list="roomList2" inputmode="numeric" placeholder="№" maxlength="4">
-        <input name="date" type="date" value="${t}" required>
-        <input name="time" type="time" value="${pad((now.getHours() + 1) % 24)}:00" required>
-      </div>
-      <button class="btn">Добавить напоминание</button>
-    </form>
-    <datalist id="roomList2">${ROOMS.map(r => `<option value="${r.num}">`).join("")}</datalist>
-    ${groups.filter(g => g[1].length).map(([title, list]) => `<div class="section-head"><h3>${title}</h3><span>${list.length}</span></div><div class="list">${list.map(remRow).join("")}</div>`).join("") || `<div class="empty">Нет активных напоминаний</div>`}
-    ${done.length ? `<div class="section-head"><h3>Выполнено</h3><button class="link" data-action="clear-done">Очистить</button></div><div class="list">${done.map(remRow).join("")}</div>` : ""}
-    <p class="notice">Напоминание срабатывает звуком/вибрацией и уведомлением, когда приложение открыто или свёрнуто недавно. Телефон в спящем режиме может его пропустить — поглядывай на список.</p>`;
-  $("#remForm").addEventListener("submit", e => {
-    e.preventDefault();
-    const el = e.currentTarget.elements, room = el.room.value.trim();
-    if (room && !ROOM_BY_NUM[room]) return toast("Нет такого номера: " + room);
-    state.data.reminders.push({ id: uid(), text: el.text.value.trim(), room, date: el.date.value, time: el.time.value, done: false, notified: false });
-    save(); toast("Напоминание добавлено"); render();
-    askNotify();
-  });
-}
-function remRow(x) {
-  const late = !x.done && remDate(x) <= new Date();
-  return `<div class="item ${x.done ? "done" : ""} ${late ? "late" : ""}">
-    <button class="check" data-toggle-rem="${x.id}" aria-label="Выполнено">${x.done ? "✓" : ""}</button>
-    <div class="item-body"><b class="time">${x.time}</b>${x.room ? `<span class="room-tag">${esc(x.room)}</span>` : ""}${esc(x.text)}<small>${shortDate(parseDate(x.date))}</small></div>
-    <button class="x" data-del-rem="${x.id}" aria-label="Удалить">✕</button></div>`;
-}
-function checkReminders() {
-  if (!state.data) return;
-  let changed = false;
-  for (const x of dueReminders()) {
-    if (x.notified) continue;
-    x.notified = true; changed = true;
-    const msg = `${x.time} ${x.room ? x.room + " — " : ""}${x.text}`;
-    vibrate([300, 150, 300, 150, 300]);
-    beep();
-    toast("⏰ " + msg);
-    try { if ("Notification" in window && Notification.permission === "granted") navigator.serviceWorker?.ready.then(r => r.showNotification("Напоминание", { body: msg, tag: x.id, icon: "icons/icon-192.png", vibrate: [300, 150, 300] })); } catch {}
-  }
-  if (changed) { save(); render(); }
-}
-function beep() {
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    [0, 0.35, 0.7].forEach(t => { const o = ctx.createOscillator(), g = ctx.createGain(); o.frequency.value = 880; o.connect(g); g.connect(ctx.destination); g.gain.setValueAtTime(0.2, ctx.currentTime + t); g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + t + 0.25); o.start(ctx.currentTime + t); o.stop(ctx.currentTime + t + 0.3); });
-  } catch {}
-}
-function askNotify() { try { if ("Notification" in window && Notification.permission === "default") Notification.requestPermission(); } catch {} }
 
 /* ---------- more: contacts, cheat sheet, backup ---------- */
 function renderMore() {
@@ -404,7 +385,6 @@ function renderMore() {
     ${backupBanner()}
     <div class="setting"><div><b>Резервная копия</b><span>${last ? "Последняя: " + fmt({ day: "numeric", month: "long", hour: "2-digit", minute: "2-digit" }, new Date(last)) : "Ещё не делалась"}</span></div><button class="btn small" data-action="backup">Сохранить</button></div>
     <div class="setting"><div><b>Восстановить из копии</b><span>Заменит текущие данные</span></div><button class="mini" data-action="import">Файл</button></div>
-    <div class="setting"><div><b>Уведомления</b><span>${"Notification" in window ? (Notification.permission === "granted" ? "Разрешены" : Notification.permission === "denied" ? "Запрещены в настройках браузера" : "Не разрешены") : "Не поддерживаются"}</span></div>${"Notification" in window && Notification.permission === "default" ? `<button class="mini" data-action="notify">Разрешить</button>` : ""}</div>
     <div class="setting danger"><div><b>Сбросить статусы номеров</b><span>Все номера станут «Свободен», заметки удалятся</span></div><button class="mini" data-action="reset-rooms">Сброс</button></div>
     <p class="notice">FrontDesk ${APP_VERSION}. Данные хранятся только на этом телефоне. Не записывай сюда фамилии, паспорта и телефоны гостей — только номера комнат и рабочие заметки.</p>`;
 }
@@ -474,7 +454,7 @@ function importBackup() {
 /* ---------- ui primitives ---------- */
 function toast(text) {
   const el = $("#toast"); el.textContent = text; el.classList.add("show");
-  clearTimeout(window.__toast); window.__toast = setTimeout(() => el.classList.remove("show"), text.startsWith("⏰") ? 8000 : 2400);
+  clearTimeout(window.__toast); window.__toast = setTimeout(() => el.classList.remove("show"), 2400);
 }
 function openModal(html) {
   $("#modalRoot").innerHTML = `<div class="modal-backdrop" id="modal"><div class="modal" role="dialog" aria-modal="true">${html}</div></div>`;
@@ -523,11 +503,9 @@ document.addEventListener("click", e => {
     const f = $("#itemForm"); f.elements.room.value = num; f.elements.text.value = note; f.elements.text.focus();
     return;
   }
-  if ((el = q("[data-toggle-item]"))) { const i = state.data.shift.items.find(x => x.id === el.dataset.toggleItem); i.done = !i.done; save(); vibrate(10); return render(); }
-  if ((el = q("[data-del-item]"))) { state.data.shift.items = state.data.shift.items.filter(x => x.id !== el.dataset.delItem); save(); return render(); }
-  if ((el = q("[data-toggle-rem]"))) { const x = state.data.reminders.find(y => y.id === el.dataset.toggleRem); x.done = !x.done; if (!x.done) x.notified = remDate(x) <= new Date(); save(); vibrate(10); return render(); }
-  if ((el = q("[data-del-rem]"))) { state.data.reminders = state.data.reminders.filter(y => y.id !== el.dataset.delRem); save(); return render(); }
-  if ((el = q("[data-rem-kind]"))) { const t = $("#remForm [name=text]"); t.value = el.dataset.remKind + (t.value ? ": " + t.value.replace(/^[^:]+:\s*/, "") : ": "); t.focus(); return; }
+  if ((el = q("[data-toggle-item]"))) { const i = shiftItems().find(x => x.id === el.dataset.toggleItem); i.done = !i.done; save(); vibrate(10); return render(); }
+  if ((el = q("[data-del-item]"))) { const xs = shiftItems(), i = xs.findIndex(x => x.id === el.dataset.delItem); if (i >= 0) xs.splice(i, 1); save(); return render(); }
+  if ((el = q("[data-start]"))) return startShift(el.dataset.start);
   if ((el = q("[data-archive]"))) { const a = state.data.archive.find(x => x.id === el.dataset.archive); return showReport(a.text, "Смена " + fmt({ day: "numeric", month: "long" }, new Date(a.startedAt))); }
   if ((el = q("[data-edit-contact]"))) return editContact(el.dataset.editContact);
   if ((el = q("[data-edit-tip]"))) return editTip(el.dataset.editTip);
@@ -535,26 +513,23 @@ document.addEventListener("click", e => {
   if ((el = q("[data-action]"))) {
     const a = el.dataset.action;
     if (a === "report") return showReport(reportText());
-    if (a === "close-shift") return confirmModal("Закрыть смену?", "Отчёт сохранится в «Прошлые смены», невыполненные задачи перейдут в новую смену. Статусы номеров не меняются.", "Закрыть смену", closeShift);
-    if (a === "clear-done") { state.data.reminders = state.data.reminders.filter(x => !x.done); save(); return render(); }
+    if (a === "close-shift") return confirmModal("Закрыть смену?", "Отчёт сохранится в «Прошлые смены», невыполненное перейдёт в следующую смену. Статусы номеров не меняются.", "Закрыть смену", closeShift);
+    if (a === "edit-shift") return editShiftDialog();
     if (a === "add-contact") return editContact(null);
     if (a === "add-tip") return editTip(null);
     if (a === "backup") return exportBackup();
     if (a === "import") return importBackup();
-    if (a === "notify") { try { Notification.requestPermission().then(render); } catch {} return; }
     if (a === "reset-rooms") return confirmModal("Сбросить все номера?", "Все 53 номера станут «Свободен», даты выезда и заметки по номерам удалятся.", "Сбросить", () => { state.data.rooms = {}; save(); render(); toast("Статусы сброшены"); });
   }
 });
 
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { checkReminders(); if (!$("#modal")) render(); } });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && !$("#modal")) render(); });
 
 async function boot() {
   await load();
   history.replaceState({ view: "rooms" }, "");
   render();
   requestPersist();
-  setInterval(checkReminders, 20000);
-  checkReminders();
   // Re-render after midnight so "выезд сегодня" marks stay correct
   let day = today();
   setInterval(() => { if (today() !== day && !$("#modal")) { day = today(); render(); } }, 60000);

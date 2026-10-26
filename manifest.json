@@ -1,7 +1,7 @@
 {
   "name": "FrontDesk — ресепшен",
   "short_name": "FrontDesk",
-  "description": "Шахматка номеров, передача смены и напоминания для ресепшена",
+  "description": "Шахматка номеров и передача смены для ресепшена",
   "lang": "ru",
   "start_url": "./",
   "scope": "./",
