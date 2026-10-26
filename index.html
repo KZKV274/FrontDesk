@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0B0D10">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="FrontDesk — шахматка номеров, передача смены и напоминания для ресепшена">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="FrontDesk">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icons/icon-192.png" type="image/png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Manrope:wght@700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <title>FrontDesk</title>
+</head>
+<body>
+<div id="toast" class="toast" aria-live="polite"></div>
+<main class="main">
+  <header class="topbar">
+    <div><p class="eyebrow" id="todayLabel">&nbsp;</p><h1 id="pageTitle">FrontDesk</h1></div>
+  </header>
+  <section id="view-rooms" class="view active"></section>
+  <section id="view-shift" class="view"></section>
+  <section id="view-reminders" class="view"></section>
+  <section id="view-more" class="view"></section>
+</main>
+<nav id="bottomNav" class="bottom-nav"></nav>
+<div id="modalRoot"></div>
+<script src="app.js"></script>
+</body>
+</html>
