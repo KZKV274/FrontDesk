@@ -1,6 +1,6 @@
 /* FrontDesk: local-first helper for a hotel receptionist */
 "use strict";
-const APP_VERSION = "1.0";
+const APP_VERSION = "1.1";
 const STORAGE_KEY = "frontdesk_data", IDB_NAME = "FrontDeskDB";
 const BACKUP_REMIND_DAYS = 7, ARCHIVE_LIMIT = 90;
 
@@ -16,7 +16,6 @@ const FLOORS = [...new Set(ROOMS.map(r => r.floor))];
 
 const STATUS = {
   free: { label: "Свободен", cls: "s-free" },
-  booked: { label: "Бронь / заезд", cls: "s-booked" },
   occupied: { label: "Занят", cls: "s-occupied" },
   dirty: { label: "Грязный", cls: "s-dirty" },
   repair: { label: "Ремонт", cls: "s-repair" },
@@ -56,6 +55,9 @@ const roomData = num => state.data.rooms[num] || { status: "free", note: "", che
 const roomLabel = num => `${num} · ${ROOM_TYPE_NAMES[ROOM_BY_NUM[num]?.type] || ""}`;
 
 // Extra marks on top of the manual status: checkout due today / overdue
+// Expected check-in is a separate mark, not a status: a room can be "occupied, checkout today" and "arrival today" at once
+function arrivalFlag(rd) { return rd.arrival && rd.arrival <= today() ? "arrival" : ""; }
+const statusLabel = k => STATUS[k]?.label || (k === "booked" ? "Бронь" : k);
 function roomFlag(rd) {
   if (rd.status !== "occupied" || !rd.checkout) return "";
   return rd.checkout < today() ? "overdue" : rd.checkout === today() ? "checkout" : "";
@@ -97,6 +99,8 @@ function normalize(d) {
   if (!out.shift || !Array.isArray(out.shift.items)) out.shift = newShift([]);
   if (!Array.isArray(out.shift.log)) out.shift.log = [];
   if (!out.rooms || typeof out.rooms !== "object") out.rooms = {};
+  // v1.0 had "booked" as a status; it is now an arrival mark on a free room
+  Object.values(out.rooms).forEach(rd => { if (rd.status === "booked") { rd.status = "free"; rd.arrival = rd.arrival || today(); } if (!STATUS[rd.status]) rd.status = "free"; });
   return out;
 }
 async function requestPersist() {
@@ -125,9 +129,9 @@ function render() {
 
 /* ---------- rooms board ---------- */
 function roomCounts() {
-  const c = { all: ROOMS.length, checkout: 0, overdue: 0 };
+  const c = { all: ROOMS.length, checkout: 0, overdue: 0, arrival: 0 };
   Object.keys(STATUS).forEach(k => { c[k] = 0; });
-  ROOMS.forEach(r => { const rd = roomData(r.num); c[rd.status]++; const f = roomFlag(rd); if (f) c[f]++; });
+  ROOMS.forEach(r => { const rd = roomData(r.num); c[rd.status]++; const f = roomFlag(rd); if (f) c[f]++; if (arrivalFlag(rd)) c.arrival++; });
   return c;
 }
 function matchesFilter(num) {
@@ -135,11 +139,12 @@ function matchesFilter(num) {
   if (f === "all") return true;
   if (f === "checkout") return roomFlag(rd) === "checkout" || roomFlag(rd) === "overdue";
   if (f === "notes") return !!rd.note;
+  if (f === "arrival") return !!arrivalFlag(rd);
   return rd.status === f;
 }
 function renderRooms() {
   const c = roomCounts(), notes = ROOMS.filter(r => roomData(r.num).note).length;
-  const chips = [["all", "Все", c.all], ["free", "Свободны", c.free], ["occupied", "Заняты", c.occupied], ["checkout", "Выезд сегодня", c.checkout + c.overdue], ["booked", "Бронь", c.booked], ["dirty", "Грязные", c.dirty], ["repair", "Ремонт", c.repair], ["block", "Блок", c.block], ["notes", "С заметкой", notes]];
+  const chips = [["all", "Все", c.all], ["free", "Свободны", c.free], ["occupied", "Заняты", c.occupied], ["checkout", "Выезд сегодня", c.checkout + c.overdue], ["arrival", "Заезд сегодня", c.arrival], ["dirty", "Грязные", c.dirty], ["repair", "Ремонт", c.repair], ["block", "Блок", c.block], ["notes", "С заметкой", notes]];
   let floors = "";
   for (const f of FLOORS) {
     const rooms = ROOMS.filter(r => r.floor === f);
@@ -155,14 +160,17 @@ function renderRooms() {
       <div class="s-repair"><span>Ремонт</span><b>${c.repair}</b></div>
     </div>
     ${c.overdue ? `<button class="alert" data-filter="checkout">⚠ Просрочен выезд: ${ROOMS.filter(r => roomFlag(roomData(r.num)) === "overdue").map(r => r.num).join(", ")}</button>` : ""}
+    ${prepList().length ? `<button class="alert prep" data-filter="arrival">🧹 Подготовить к заезду: ${prepList().map(r => `${r.num} (${roomData(r.num).status === "occupied" ? "ещё занят" : "грязный"})`).join(", ")}</button>` : ""}
     <div class="chip-row">${chips.map(([id, l, n]) => `<button class="chip ${state.roomFilter === id ? "active" : ""}" data-filter="${id}">${l} <small>${n}</small></button>`).join("")}</div>
     ${floors || `<div class="empty">Нет номеров с таким статусом</div>`}
-    <div class="legend">${Object.entries(STATUS).map(([k, s]) => `<span><i class="${s.cls}"></i>${s.label}</span>`).join("")}<span><i class="flag-dot"></i>Выезд сегодня</span></div>`;
+    <div class="legend">${Object.entries(STATUS).map(([k, s]) => `<span><i class="${s.cls}"></i>${s.label}</span>`).join("")}<span><i class="flag-dot"></i>Выезд сегодня</span><span><i class="arr-dot">↓</i>Заезд сегодня</span><span><i class="note-dot"></i>Есть заметка</span></div>`;
 }
+// Rooms with an arrival today that are not ready yet: guest still inside or room not cleaned
+function prepList() { return ROOMS.filter(r => { const rd = roomData(r.num); return arrivalFlag(rd) && (rd.status === "dirty" || rd.status === "occupied"); }); }
 function roomTile(r, visible) {
-  const rd = roomData(r.num), flag = roomFlag(rd);
-  return `<button class="room ${STATUS[rd.status].cls} ${visible ? "" : "faded"} ${flag}" data-room="${r.num}" aria-label="${roomLabel(r.num)}, ${STATUS[rd.status].label}">
-    <b>${r.num}</b><small>${ROOM_TYPES[r.type]}</small>${rd.note ? `<i class="note-dot"></i>` : ""}${flag ? `<i class="flag-dot"></i>` : ""}</button>`;
+  const rd = roomData(r.num), flag = roomFlag(rd), arr = arrivalFlag(rd);
+  return `<button class="room ${STATUS[rd.status].cls} ${visible ? "" : "faded"} ${flag} ${arr}" data-room="${r.num}" aria-label="${roomLabel(r.num)}, ${STATUS[rd.status].label}">
+    <b>${r.num}</b><small>${ROOM_TYPES[r.type]}</small>${rd.note ? `<i class="note-dot"></i>` : ""}${flag ? `<i class="flag-dot"></i>` : ""}${arr ? `<i class="arr-dot">↓</i>` : ""}</button>`;
 }
 function setRoomStatus(num, status) {
   const rd = { ...roomData(num) }, from = rd.status;
@@ -170,6 +178,7 @@ function setRoomStatus(num, status) {
   rd.status = status;
   rd.since = status === "repair" || status === "block" ? today() : rd.since && (from === "repair" || from === "block") ? "" : rd.since;
   if (status !== "occupied") rd.checkout = "";
+  if (status === "occupied" && arrivalFlag(rd)) { rd.arrival = ""; rd.arrivalTime = ""; }
   rd.updatedAt = Date.now();
   state.data.rooms[num] = rd;
   state.data.shift.log.push({ t: Date.now(), room: num, from, to: status });
@@ -177,26 +186,32 @@ function setRoomStatus(num, status) {
   vibrate(15);
 }
 function openRoom(num) {
-  const r = ROOM_BY_NUM[num], rd = roomData(num), flag = roomFlag(rd);
+  const r = ROOM_BY_NUM[num], rd = roomData(num), flag = roomFlag(rd), arr = arrivalFlag(rd);
   const quick = rd.status === "occupied" ? `<button class="btn" data-quick="dirty">Выехал → грязный</button>`
     : rd.status === "dirty" ? `<button class="btn" data-quick="free">Убран → свободен</button>`
-    : rd.status === "booked" ? `<button class="btn" data-quick="occupied">Заехал → занят</button>`
-    : rd.status === "free" ? `<button class="btn" data-quick="occupied">Заселить</button>` : "";
+    : rd.status === "free" ? `<button class="btn" data-quick="occupied">${arr ? "Гость заехал → занят" : "Заселить"}</button>` : "";
   const box = openModal(`
     <div class="sheet-head"><div><h3>${r.num}</h3><span>${ROOM_TYPE_NAMES[r.type]} · ${r.floor} этаж</span></div><span class="status-tag ${STATUS[rd.status].cls}">${STATUS[rd.status].label}</span></div>
     ${flag === "overdue" ? `<div class="warn">Выезд был ${shortDate(parseDate(rd.checkout))} — просрочен</div>` : flag === "checkout" ? `<div class="warn">Выезд сегодня</div>` : ""}
+    ${rd.arrival ? `<div class="ok">${arr ? (rd.arrival < today() ? `Заезд ожидался ${shortDate(parseDate(rd.arrival))}` : "Заезд сегодня") : `Заезд ${shortDate(parseDate(rd.arrival))}`}${rd.arrivalTime ? " в " + rd.arrivalTime : ""}${arr && rd.status === "occupied" ? " — после выезда текущего гостя" : arr && rd.status === "dirty" ? " — нужна уборка" : ""}</div>` : ""}
     ${rd.since ? `<div class="muted small">${STATUS[rd.status].label} с ${shortDate(parseDate(rd.since))} (${Math.max(0, Math.round((parseDate(today()) - parseDate(rd.since)) / 86400000))} дн.)</div>` : ""}
     ${quick ? `<div class="quick">${quick}</div>` : ""}
     <div class="label">Статус</div>
     <div class="status-grid">${Object.entries(STATUS).map(([k, s]) => `<button class="status-btn ${s.cls} ${rd.status === k ? "active" : ""}" data-set-status="${k}">${s.label}</button>`).join("")}</div>
     <div class="field ${rd.status === "occupied" ? "" : "hidden"}" id="checkoutField"><label>Дата выезда</label>
       <div class="date-row"><input type="date" id="checkoutInput" value="${rd.checkout || ""}"><button class="chip" data-checkout="0">Сегодня</button><button class="chip" data-checkout="1">Завтра</button></div></div>
+    <div class="field"><label>Заезд по брони <span class="muted">· можно вместе с выездом в тот же день</span></label>
+      <div class="date-row"><input type="date" id="arrivalInput" value="${rd.arrival || ""}"><button class="chip" data-arrival="0">Сегодня</button><button class="chip" data-arrival="1">Завтра</button></div>
+      <div class="date-row two"><input type="time" id="arrivalTime" value="${rd.arrivalTime || ""}" aria-label="Время заезда"><button class="chip" data-arrival="clear">Убрать заезд</button></div></div>
     <div class="field"><label>Заметка по номеру <span class="muted">· без личных данных гостей</span></label><textarea id="roomNote" rows="3" maxlength="400" placeholder="Например: течёт кран, вызвали техника; поздний выезд до 14:00">${esc(rd.note)}</textarea></div>
     <div class="modal-actions"><button class="btn secondary" data-to-shift>＋ В передачу смены</button><button class="btn" data-close>Готово</button></div>`);
   box.dataset.sheet = num;
   const noteEl = box.querySelector("#roomNote");
   noteEl.addEventListener("input", () => { const x = { ...roomData(num), note: noteEl.value.trim(), updatedAt: Date.now() }; state.data.rooms[num] = x; save(); });
-  box.querySelector("#checkoutInput").addEventListener("change", e => { state.data.rooms[num] = { ...roomData(num), checkout: e.target.value, updatedAt: Date.now() }; save(); });
+  const setField = (k, v) => { state.data.rooms[num] = { ...roomData(num), [k]: v, updatedAt: Date.now() }; save(); };
+  box.querySelector("#checkoutInput").addEventListener("change", e => setField("checkout", e.target.value));
+  box.querySelector("#arrivalInput").addEventListener("change", e => { setField("arrival", e.target.value); openRoom(num); });
+  box.querySelector("#arrivalTime").addEventListener("change", e => setField("arrivalTime", e.target.value));
 }
 function closeRoomSheet() { closeModal(); render(); }
 
@@ -224,7 +239,7 @@ function renderShift() {
     <div class="card info">
       <div><span>Занято / свободно / грязных</span><b>${c.occupied} / ${c.free} / ${c.dirty}</b></div>
       <div><span>Выезды сегодня</span><b>${checkouts.length ? checkouts.map(r => r.num + (roomFlag(roomData(r.num)) === "overdue" ? "⚠" : "")).join(", ") : "—"}</b></div>
-      <div><span>Бронь / заезды</span><b>${ROOMS.filter(r => roomData(r.num).status === "booked").map(r => r.num).join(", ") || "—"}</b></div>
+      <div><span>Заезды сегодня</span><b>${ROOMS.filter(r => arrivalFlag(roomData(r.num))).map(r => r.num + (prepList().includes(r) ? "🧹" : "")).join(", ") || "—"}</b></div>
       <div><span>Ремонт / блок</span><b>${repair.length ? repair.map(r => r.num).join(", ") : "—"}</b></div>
       <div><span>Напоминания на сегодня-завтра</span><b>${remToday.length || "—"}</b></div>
       <div><span>Изменений статусов за смену</span><b>${netChanges(sh.log).length || "—"}</b></div>
@@ -267,11 +282,11 @@ function reportText(sh = state.data.shift, closedAt = Date.now()) {
   const list = pred => ROOMS.filter(r => pred(roomData(r.num), r)).map(r => r.num);
   const repair = ROOMS.filter(r => ["repair", "block"].includes(roomData(r.num).status)).map(r => { const rd = roomData(r.num); return `${r.num}${rd.status === "block" ? " (блок)" : ""}${rd.since ? " с " + ddmm(parseDate(rd.since)) : ""}${rd.note ? " — " + rd.note : ""}`; });
   const c = roomCounts();
-  L.push("НОМЕРА:", `Занято ${c.occupied}, свободно ${c.free}, бронь ${c.booked}, грязных ${c.dirty}, ремонт ${c.repair}, блок ${c.block}`);
-  const out = list(rd => roomFlag(rd) === "checkout"), late = list(rd => roomFlag(rd) === "overdue"), booked = list(rd => rd.status === "booked"), dirty = list(rd => rd.status === "dirty");
+  L.push("НОМЕРА:", `Занято ${c.occupied}, свободно ${c.free}, заездов сегодня ${c.arrival}, грязных ${c.dirty}, ремонт ${c.repair}, блок ${c.block}`);
+  const out = list(rd => roomFlag(rd) === "checkout"), late = list(rd => roomFlag(rd) === "overdue"), booked = ROOMS.filter(r => arrivalFlag(roomData(r.num))).map(r => { const rd = roomData(r.num); return r.num + (rd.arrivalTime ? " " + rd.arrivalTime : "") + (rd.status === "occupied" ? " (после выезда)" : rd.status === "dirty" ? " (не убран)" : ""); }), dirty = list(rd => rd.status === "dirty");
   if (out.length) L.push(`Выезд сегодня: ${out.join(", ")}`);
   if (late.length) L.push(`Просрочен выезд: ${late.join(", ")}`);
-  if (booked.length) L.push(`Ожидаются заезды: ${booked.join(", ")}`);
+  if (booked.length) L.push(`Заезды сегодня: ${booked.join(", ")}`);
   if (dirty.length) L.push(`Грязные: ${dirty.join(", ")}`);
   if (repair.length) { L.push("Ремонт / блок:"); repair.forEach(x => L.push("• " + x)); }
   const notes = ROOMS.filter(r => roomData(r.num).note && !["repair", "block"].includes(roomData(r.num).status));
@@ -279,14 +294,20 @@ function reportText(sh = state.data.shift, closedAt = Date.now()) {
   const rem = state.data.reminders.filter(x => !x.done && x.date <= dateISO(addDays(e, 1))).sort(byWhen);
   if (rem.length) { L.push("", "НАПОМИНАНИЯ:"); rem.forEach(x => L.push(`• ${x.date === dateISO(e) ? "" : ddmm(parseDate(x.date)) + " "}${x.time} ${x.room ? x.room + " — " : ""}${x.text}`)); }
   const changes = netChanges(sh.log);
-  if (changes.length) { L.push("", "ИЗМЕНЕНИЯ ЗА СМЕНУ:"); changes.forEach(l => L.push(`${hmOf(new Date(l.t))} ${l.room}: ${STATUS[l.from]?.label || l.from} → ${STATUS[l.to]?.label || l.to}`)); }
+  if (changes.length) { L.push("", "ИЗМЕНЕНИЯ ЗА СМЕНУ:"); changes.forEach(l => L.push(`${hmOf(new Date(l.t))} ${l.room}: ${l.path.map(statusLabel).join(" → ")}`)); }
   return L.join("\n").trim();
 }
-// One line per room: first status of the shift -> last status; rooms that ended where they started are skipped
+// One line per room with the whole chain of the shift (e.g. Занят → Грязный → Свободен → Занят for a same-day turnover);
+// a status set and then undone (A → B → A with nothing else) is dropped
 function netChanges(log) {
   const by = new Map();
-  log.forEach(l => { const p = by.get(l.room); by.set(l.room, p ? { ...p, to: l.to, t: l.t } : { ...l }); });
-  return [...by.values()].filter(l => l.from !== l.to).sort((a, b) => a.t - b.t);
+  log.forEach(l => {
+    const p = by.get(l.room);
+    if (!p) return by.set(l.room, { room: l.room, t: l.t, path: [l.from, l.to] });
+    if (p.path[p.path.length - 1] !== l.to) p.path.push(l.to);
+    p.t = l.t;
+  });
+  return [...by.values()].filter(l => l.path.length > 3 || l.path[0] !== l.path[l.path.length - 1]).sort((a, b) => a.t - b.t);
 }
 function showReport(text, title = "Отчёт за смену") {
   const box = openModal(`<h3>${title}</h3><p class="muted small">Можно переписать в журнал, скопировать или отправить.</p><pre class="report">${esc(text)}</pre>
@@ -482,13 +503,18 @@ document.addEventListener("click", e => {
   if ((el = q("[data-set-status]")) || (el = q("[data-quick]"))) {
     const box = el.closest(".modal"), num = box.dataset.sheet;
     setRoomStatus(num, el.dataset.setStatus || el.dataset.quick);
-    if (el.dataset.quick) { closeRoomSheet(); return toast(`${num}: ${STATUS[el.dataset.quick].label}`); }
+    if (el.dataset.quick && el.dataset.quick !== "occupied") { closeRoomSheet(); return toast(`${num}: ${STATUS[el.dataset.quick].label}`); }
     return openRoom(num);
   }
   if ((el = q("[data-checkout]"))) {
     const box = el.closest(".modal"), num = box.dataset.sheet, v = dateISO(addDays(new Date(), Number(el.dataset.checkout)));
     state.data.rooms[num] = { ...roomData(num), checkout: v, updatedAt: Date.now() }; save();
     box.querySelector("#checkoutInput").value = v; return;
+  }
+  if ((el = q("[data-arrival]"))) {
+    const num = el.closest(".modal").dataset.sheet, v = el.dataset.arrival;
+    state.data.rooms[num] = { ...roomData(num), arrival: v === "clear" ? "" : dateISO(addDays(new Date(), Number(v))), ...(v === "clear" ? { arrivalTime: "" } : {}), updatedAt: Date.now() };
+    save(); return openRoom(num);
   }
   if ((el = q("[data-to-shift]"))) {
     const box = el.closest(".modal"), num = box.dataset.sheet, note = box.querySelector("#roomNote").value.trim();

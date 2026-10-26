@@ -147,3 +147,13 @@ textarea{resize:vertical}
 .toast.show{transform:translate(-50%,0);opacity:1}
 @media(min-width:760px){.modal-backdrop{place-items:center;padding:12px}.modal{border-radius:24px}.room b{font-size:15px}.room{min-height:60px}}
 @media(max-width:360px){.room b{font-size:11px}.summary b{font-size:18px}.room-grid{gap:3px}}
+
+/* v1.1: arrival mark */
+.arr-dot{position:absolute;bottom:2px;right:3px;font:800 10px Inter;font-style:normal;color:var(--booked);line-height:1}
+.room.arrival{box-shadow:inset 0 -3px 0 var(--booked)}
+.room.overdue.arrival{box-shadow:0 0 0 2px var(--repair),inset 0 -3px 0 var(--booked)}
+.legend .arr-dot{position:static;font-size:12px}
+.legend .note-dot{position:static;display:inline-block}
+.ok{color:var(--booked);font-size:13px;font-weight:700;margin:4px 0}
+.date-row.two{grid-template-columns:1fr auto;margin-top:6px}
+.alert.prep{border-color:rgba(255,174,85,.4);background:rgba(255,174,85,.1);color:var(--dirty)}
