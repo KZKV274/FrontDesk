@@ -1,6 +1,6 @@
 /* Network-first for the app's own files so updates arrive right away; cache is the offline fallback */
-const CACHE = "frontdesk-v5";
-const CORE = ["./", "./index.html", "./style.css", "./app.js", "./manifest.json", "./icons/icon-192.png", "./icons/icon-512.png"];
+const CACHE = "frontdesk-v6";
+const CORE = ["./", "./index.html", "./style.css", "./app.js", "./game.js", "./manifest.json", "./icons/icon-192.png", "./icons/icon-512.png"];
 
 self.addEventListener("install", e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(CORE)).then(() => self.skipWaiting())); });
 self.addEventListener("activate", e => {

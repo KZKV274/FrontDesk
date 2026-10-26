@@ -1,6 +1,6 @@
 /* FrontDesk: local-first helper for a hotel receptionist */
 "use strict";
-const APP_VERSION = "1.4";
+const APP_VERSION = "1.5";
 const STORAGE_KEY = "frontdesk_data", IDB_NAME = "FrontDeskDB";
 const BACKUP_REMIND_DAYS = 7, ARCHIVE_LIMIT = 90;
 
@@ -23,7 +23,7 @@ const STATUS = {
 };
 
 /* ---------- state ---------- */
-const state = { view: "rooms", roomFilter: "all", statsMode: "month", statsOffset: 0, data: null };
+const state = { view: "rooms", roomFilter: "all", data: null };
 const emptyData = () => ({
   version: 1, savedAt: 0,
   rooms: {}, // num -> {status, note, checkout, since, updatedAt}
@@ -117,8 +117,8 @@ async function requestPersist() {
 }
 
 /* ---------- navigation ---------- */
-const navItems = [["rooms", "▦", "Номера"], ["shift", "✎", "Смена"], ["stats", "◔", "Статистика"], ["more", "☰", "Ещё"]];
-const titles = { rooms: "Номера", shift: "Смена", stats: "Статистика", more: "Ещё" };
+const navItems = [["rooms", "▦", "Номера"], ["shift", "✎", "Смена"], ["game", "🎮", "Игра"], ["more", "☰", "Ещё"]];
+const titles = { rooms: "Номера", shift: "Смена", game: "Ресепшн: час пик", more: "Ещё" };
 function go(view) {
   if (view !== state.view) history.pushState({ view }, "");
   state.view = view;
@@ -131,7 +131,7 @@ function render() {
   document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + state.view));
   if (!titles[state.view]) state.view = "rooms";
   $("#bottomNav").innerHTML = navItems.map(([id, icon, label]) => `<button class="nav-item ${state.view === id ? "active" : ""}" data-nav="${id}"><span class="nav-icon">${icon}${id === "shift" && !state.data.shift ? `<i class="badge">!</i>` : ""}</span><span>${label}</span></button>`).join("");
-  ({ rooms: renderRooms, shift: renderShift, stats: renderStats, more: renderMore })[state.view]();
+  ({ rooms: renderRooms, shift: renderShift, game: () => renderGame(), more: renderMore })[state.view]();
   $("#pageTitle").textContent = titles[state.view];
   $("#todayLabel").textContent = fmt({ weekday: "long", day: "numeric", month: "long" }, new Date());
 }
@@ -415,11 +415,7 @@ function closeShift() {
   toast(carried.length ? `Смена закрыта. В следующую смену перейдёт: ${carried.length}` : "Смена закрыта");
 }
 
-/* ---------- statistics ---------- */
-const DAY = 86400000;
-const nightsOf = (st, until = Date.now()) => Math.round((parseDate(dateISO(new Date(st.out || until))) - parseDate(dateISO(new Date(st.in)))) / DAY);
-const nightsWord = n => `${n} ${plural(n, "ночь", "ночи", "ночей")}`;
-const dec = n => (Math.round(n * 10) / 10).toString().replace(".", ",");
+/* ---------- stays: check-in / check-out records for the shift report ---------- */
 function lastStay(stays, num) { for (let i = stays.length - 1; i >= 0; i--) if (stays[i].room === num) return stays[i]; return null; }
 // Becoming "Занят" opens a stay, leaving "Занят" closes it. A wrong tap undone within minutes leaves no fake stay
 function recordTransition(stays, num, from, to, t) {
@@ -445,82 +441,6 @@ function rebuildStays(d) {
   });
   return { stays, since: logs.length ? logs[0].t : Date.now() };
 }
-function statsRange() {
-  const now = new Date(), o = state.statsOffset;
-  if (state.statsMode === "week") { const s = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (now.getDay() + 6) % 7 + o * 7); return [s, addDays(s, 7)]; }
-  if (state.statsMode === "year") return [new Date(now.getFullYear() + o, 0, 1), new Date(now.getFullYear() + o + 1, 0, 1)];
-  const s = new Date(now.getFullYear(), now.getMonth() + o, 1);
-  return [s, new Date(s.getFullYear(), s.getMonth() + 1, 1)];
-}
-function statsLabel([a, b]) {
-  if (state.statsMode === "year") return String(a.getFullYear());
-  if (state.statsMode === "week") return `${shortDate(a)} – ${shortDate(addDays(b, -1))}`;
-  return fmt({ month: "long", year: "numeric" }, a).replace(/\s?г\.?$/, "");
-}
-const stayDates = st => `${shortDate(new Date(st.in))} ${hmOf(new Date(st.in))}${st.approx ? "≈" : ""} → ${st.out ? shortDate(new Date(st.out)) + " " + hmOf(new Date(st.out)) : "живёт"}`;
-// Rooms occupied on the night of the given date
-function occupiedOn(iso, end) { return state.data.stays.filter(st => dateISO(new Date(st.in)) <= iso && (st.out ? dateISO(new Date(st.out)) > iso : iso <= end)).length; }
-function renderStats() {
-  const [a, b] = statsRange(), A = a.getTime(), B = b.getTime(), st = state.data.stays, t = today(), mode = state.statsMode;
-  const ins = st.filter(x => !x.approx && x.in >= A && x.in < B), outs = st.filter(x => x.out && x.out >= A && x.out < B);
-  const nights = outs.map(x => nightsOf(x)), avgN = nights.length ? nights.reduce((x, y) => x + y, 0) / nights.length : 0;
-  const days = [];
-  for (let d = new Date(a); d < b && dateISO(d) <= t; d = addDays(d, 1)) days.push(dateISO(d));
-  const occ = days.map(iso => occupiedOn(iso, t)), avgOcc = occ.length ? occ.reduce((x, y) => x + y, 0) / occ.length : 0;
-  const pct = n => Math.round(n / ROOMS.length * 100);
-  const sameDay = (ms, iso) => dateISO(new Date(ms)) === iso;
-  let bars;
-  if (mode === "year") {
-    bars = Array.from({ length: 12 }, (_, m) => {
-      const v = occ.filter((_, i) => Number(days[i].slice(5, 7)) === m + 1), n = ins.filter(x => new Date(x.in).getMonth() === m).length;
-      const avg = v.length ? v.reduce((x, y) => x + y, 0) / v.length : null;
-      return { label: fmt({ month: "narrow" }, new Date(a.getFullYear(), m, 1)), v: avg, show: true, tip: `${fmt({ month: "long" }, new Date(a.getFullYear(), m, 1))}: загрузка ${avg === null ? "—" : pct(avg) + "%"}, заселений ${n}` };
-    });
-  } else {
-    bars = [];
-    for (let d = new Date(a), i = 0; d < b; d = addDays(d, 1), i++) {
-      const iso = dateISO(d), k = days.indexOf(iso), n = ins.filter(x => sameDay(x.in, iso)).length, o = outs.filter(x => sameDay(x.out, iso)).length;
-      bars.push({ label: mode === "week" ? fmt({ weekday: "short" }, d) : String(d.getDate()), v: k >= 0 ? occ[k] : null, show: mode === "week" || i % 5 === 0, tip: `${fmt({ weekday: "short", day: "numeric", month: "short" }, d)}: занято ${k >= 0 ? occ[k] + " (" + pct(occ[k]) + "%)" : "—"}, заселений ${n}, выездов ${o}` });
-    }
-  }
-  const byType = Object.keys(ROOM_TYPES).map(type => {
-    const i = ins.filter(x => ROOM_BY_NUM[x.room]?.type === type).length, o = outs.filter(x => ROOM_BY_NUM[x.room]?.type === type).map(x => nightsOf(x));
-    return { type, i, avg: o.length ? o.reduce((x, y) => x + y, 0) / o.length : 0, rooms: ROOMS.filter(r => r.type === type).length };
-  });
-  const buckets = [["Дневное (0)", n => n === 0], ["1 ночь", n => n === 1], ["2 ночи", n => n === 2], ["3 ночи", n => n === 3], ["4–6 ночей", n => n >= 4 && n <= 6], ["7+ ночей", n => n >= 7]].map(([l, f]) => [l, nights.filter(f).length]);
-  const maxB = Math.max(1, ...buckets.map(x => x[1]));
-  const wd = [0, 0, 0, 0, 0, 0, 0]; ins.forEach(x => { wd[(new Date(x.in).getDay() + 6) % 7]++; });
-  const maxW = Math.max(1, ...wd);
-  const living = st.filter(x => !x.out).sort((x, y) => x.in - y.in);
-  const journal = st.slice().sort((x, y) => y.in - x.in).slice(0, 25);
-  $("#view-stats").innerHTML = `
-    <div class="segmented">${[["week", "Неделя"], ["month", "Месяц"], ["year", "Год"]].map(([id, l]) => `<button class="${mode === id ? "active" : ""}" data-stats="${id}">${l}</button>`).join("")}</div>
-    <div class="period-nav"><button class="icon-mini" data-period="-1" aria-label="Назад">‹</button><strong>${statsLabel([a, b])}</strong><button class="icon-mini" data-period="1" ${state.statsOffset >= 0 ? "disabled" : ""} aria-label="Вперёд">›</button></div>
-    <div class="stat-grid">
-      <div><span>Заселений</span><b>${ins.length}</b></div>
-      <div><span>Выездов</span><b>${outs.length}</b></div>
-      <div><span>Средний срок</span><b>${outs.length ? dec(avgN) : "—"}</b><small>${outs.length ? plural(Math.round(avgN), "ночь", "ночи", "ночей") : ""}</small></div>
-      <div><span>Загрузка</span><b>${occ.length ? pct(avgOcc) + "%" : "—"}</b><small>${occ.length ? "≈" + Math.round(avgOcc) + " из " + ROOMS.length : ""}</small></div>
-    </div>
-    <div class="card"><div class="section-head top"><h3>Загрузка по ${mode === "year" ? "месяцам" : "дням"}</h3><span>высота — % занятых</span></div>
-      <div class="bars">${bars.map(x => `<button class="bar-col" data-bar="${esc(x.tip)}"><i style="height:${x.v === null ? 0 : Math.max(2, x.v / ROOMS.length * 100)}%" class="${x.v === null ? "" : pct(x.v) >= 85 ? "hi" : ""}"></i><small>${x.show ? x.label : ""}</small></button>`).join("")}</div>
-    </div>
-    <div class="section-head"><h3>По типам номеров</h3></div>
-    <div class="card table">
-      <div class="tr th"><span>Тип</span><span>Заселений</span><span>Ср. срок</span></div>
-      ${byType.map(x => `<div class="tr"><span><b>${ROOM_TYPES[x.type]}</b> ${ROOM_TYPE_NAMES[x.type]} <small>(${x.rooms})</small></span><span>${x.i}</span><span>${x.avg ? dec(x.avg) + " н." : "—"}</span></div>`).join("")}
-    </div>
-    <div class="section-head"><h3>Сколько живут</h3><span>по выездам</span></div>
-    <div class="card hbars">${buckets.map(([l, n]) => `<div class="hb"><span>${l}</span><div><i style="width:${n / maxB * 100}%"></i></div><b>${n}</b></div>`).join("")}</div>
-    <div class="section-head"><h3>Заселения по дням недели</h3></div>
-    <div class="card hbars">${["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"].map((l, i) => `<div class="hb"><span>${l}</span><div><i style="width:${wd[i] / maxW * 100}%"></i></div><b>${wd[i]}</b></div>`).join("")}</div>
-    <div class="section-head"><h3>Сейчас живут</h3><span>${living.length}</span></div>
-    <div class="list">${living.length ? living.slice(0, 10).map(x => { const rd = roomData(x.room); return `<div class="item"><span class="room-tag">${x.room}</span><div class="item-body">${nightsWord(nightsOf(x))}${x.approx ? " (≈)" : ""}<small>с ${shortDate(new Date(x.in))}${rd.checkout ? " · выезд " + shortDate(parseDate(rd.checkout)) : ""}</small></div></div>`; }).join("") : `<div class="empty">Сейчас нет занятых номеров</div>`}</div>
-    <div class="section-head"><h3>Журнал заселений</h3><span>последние ${journal.length}</span></div>
-    <div class="list">${journal.length ? journal.map(x => `<div class="item"><span class="room-tag">${x.room}</span><div class="item-body">${stayDates(x)}<small>${x.out ? nightsWord(nightsOf(x)) : "живёт " + nightsWord(nightsOf(x))}</small></div><button class="x" data-del-stay="${x.id}" aria-label="Удалить">✕</button></div>`).join("") : `<div class="empty">Записей пока нет. Отмечай номера «Занят» при заселении и «Выехал» при выезде — статистика соберётся сама.</div>`}</div>
-    <p class="notice">Статистика ведётся с ${fmt({ day: "numeric", month: "long", year: "numeric" }, new Date(state.data.statsSince))}. Заселение — номер стал «Занят», выезд — номер перестал быть «Занят». Ошибочное нажатие, исправленное в течение нескольких минут, не считается. ≈ — номер был занят до начала учёта, дата заезда примерная.</p>`;
-}
-
 /* ---------- more: contacts, cheat sheet, backup ---------- */
 function renderMore() {
   const d = state.data, last = d.settings.lastBackupAt;
@@ -656,13 +576,6 @@ document.addEventListener("click", e => {
   if ((el = q("[data-toggle-item]"))) { const i = shiftItems().find(x => x.id === el.dataset.toggleItem); i.done = !i.done; save(); vibrate(10); return render(); }
   if ((el = q("[data-del-item]"))) { const xs = shiftItems(), i = xs.findIndex(x => x.id === el.dataset.delItem); if (i >= 0) xs.splice(i, 1); save(); return render(); }
   if ((el = q("[data-start]"))) return startShift(el.dataset.start);
-  if ((el = q("[data-stats]"))) { state.statsMode = el.dataset.stats; state.statsOffset = 0; return render(); }
-  if ((el = q("[data-period]"))) { state.statsOffset = Math.min(0, state.statsOffset + Number(el.dataset.period)); return render(); }
-  if ((el = q("[data-bar]"))) return toast(el.dataset.bar);
-  if ((el = q("[data-del-stay]"))) {
-    const st = state.data.stays.find(x => x.id === el.dataset.delStay);
-    return confirmModal("Удалить запись?", `${st.room}: ${stayDates(st)}. Удаляй, только если это ошибка — например, номер отметили занятым по ошибке.`, "Удалить", () => { state.data.stays = state.data.stays.filter(x => x !== st); save(); render(); });
-  }
   if ((el = q("[data-archive]"))) { const a = state.data.archive.find(x => x.id === el.dataset.archive); return showReport(a.text, "Смена " + fmt({ day: "numeric", month: "long" }, new Date(a.startedAt))); }
   if ((el = q("[data-edit-contact]"))) return editContact(el.dataset.editContact);
   if ((el = q("[data-edit-tip]"))) return editTip(el.dataset.editTip);
