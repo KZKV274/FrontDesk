@@ -1,6 +1,6 @@
 /* FrontDesk: local-first helper for a hotel receptionist */
 "use strict";
-const APP_VERSION = "1.5";
+const APP_VERSION = "1.6";
 const STORAGE_KEY = "frontdesk_data", IDB_NAME = "FrontDeskDB";
 const BACKUP_REMIND_DAYS = 7, ARCHIVE_LIMIT = 90;
 
